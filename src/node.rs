@@ -24,7 +24,7 @@ impl NodeClient {
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({
-            "jsonrpc": "1.1",
+            "jsonrpc": "1.0",
             "id": 1,
             "method": method,
             "params": params
