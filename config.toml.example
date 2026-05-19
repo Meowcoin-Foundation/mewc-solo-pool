@@ -1,0 +1,12 @@
+[node]
+rpc_url  = "http://127.0.0.1:8766"
+rpc_user = "user"
+rpc_pass = "pass"
+zmq_url  = "tcp://127.0.0.1:28332"
+
+[stratum]
+port               = 3333
+initial_difficulty = 1000
+
+[pool]
+db_path = "blocks.db"

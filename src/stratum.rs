@@ -1,0 +1,331 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use anyhow::Result;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{broadcast, Mutex};
+use tracing::{debug, error, info, warn};
+
+use crate::db::{self, Db};
+use crate::job::{diff_to_target, Job};
+use crate::node::NodeClient;
+use crate::verify;
+use crate::{SharedJob, StratumConfig};
+
+pub async fn serve(
+    cfg: StratumConfig,
+    node: Arc<NodeClient>,
+    current_job: SharedJob,
+    job_tx: Arc<broadcast::Sender<Job>>,
+    db: Db,
+) -> Result<()> {
+    let addr = format!("0.0.0.0:{}", cfg.port);
+    let listener = TcpListener::bind(&addr).await?;
+    info!("Stratum listening on {addr}");
+
+    let db = Arc::new(db);
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        info!("Miner connected: {peer}");
+
+        let node2 = Arc::clone(&node);
+        let cj = Arc::clone(&current_job);
+        let rx = job_tx.subscribe();
+        let db2 = Arc::clone(&db);
+        let initial_diff = cfg.initial_difficulty;
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_miner(stream, node2, cj, rx, db2, initial_diff).await {
+                warn!("Miner {peer} disconnected: {e}");
+            }
+        });
+    }
+}
+
+struct MinerState {
+    address: Option<String>,
+    worker: String,
+    difficulty: u64,
+    /// job_id → (Job, header_hash_hex, merkle_root)
+    active_jobs: HashMap<String, (Job, String, [u8; 32])>,
+}
+
+impl MinerState {
+    fn new(initial_diff: u64) -> Self {
+        Self {
+            address: None,
+            worker: String::new(),
+            difficulty: initial_diff,
+            active_jobs: HashMap::new(),
+        }
+    }
+}
+
+async fn handle_miner(
+    stream: TcpStream,
+    node: Arc<NodeClient>,
+    current_job: SharedJob,
+    mut job_rx: broadcast::Receiver<Job>,
+    db: Arc<Db>,
+    initial_diff: u64,
+) -> Result<()> {
+    let (reader, writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let writer = Arc::new(Mutex::new(writer));
+
+    let state = Arc::new(Mutex::new(MinerState::new(initial_diff)));
+
+    // Spawn task to push new jobs as they arrive.
+    {
+        let writer2 = Arc::clone(&writer);
+        let state2 = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                match job_rx.recv().await {
+                    Ok(job) => {
+                        let addr_opt = state2.lock().await.address.clone();
+                        if let Some(addr_clone) = addr_opt {
+                            let (hh_bytes, mr) = job.header_hash(&addr_clone);
+                            let hh_hex_str = hex::encode(hh_bytes);
+                            let notify = build_notify(&job, &hh_hex_str, true);
+                            let _ = send_msg(&writer2, notify).await;
+                            let mut st2 = state2.lock().await;
+                            st2.active_jobs.insert(
+                                job.id.clone(),
+                                (job, hh_hex_str, mr),
+                            );
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Job broadcast lagged by {n}");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            break; // EOF
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        debug!("← {trimmed}");
+
+        let msg: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("JSON parse error: {e}");
+                continue;
+            }
+        };
+
+        let id = msg.get("id").cloned().unwrap_or(Value::Null);
+        let method = msg["method"].as_str().unwrap_or("").to_string();
+        let params = msg["params"].clone();
+
+        let response = match method.as_str() {
+            "mining.subscribe" => handle_subscribe(id),
+
+            "mining.authorize" => {
+                handle_authorize(
+                    id,
+                    &params,
+                    &state,
+                    &current_job,
+                    &writer,
+                    initial_diff,
+                )
+                .await
+            }
+
+            "mining.submit" => {
+                handle_submit(id, &params, &state, &node, &db, &writer).await
+            }
+
+            other => {
+                warn!("Unknown method: {other}");
+                json!({"id": id, "result": null, "error": [20, "Unknown method", null]})
+            }
+        };
+
+        send_msg(&writer, response).await?;
+    }
+
+    Ok(())
+}
+
+fn handle_subscribe(id: Value) -> Value {
+    let session_id = hex::encode(uuid::Uuid::new_v4().as_bytes());
+    json!({
+        "id": id,
+        "result": [null, session_id],
+        "error": null
+    })
+}
+
+async fn handle_authorize(
+    id: Value,
+    params: &Value,
+    state: &Arc<Mutex<MinerState>>,
+    current_job: &SharedJob,
+    writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    initial_diff: u64,
+) -> Value {
+    let address = params[0].as_str().unwrap_or("").to_string();
+    let worker = params[1].as_str().unwrap_or("default").to_string();
+
+    info!("Miner authorized: {address}.{worker}");
+
+    {
+        let mut st = state.lock().await;
+        st.address = Some(address.clone());
+        st.worker = worker;
+    }
+
+    // Push difficulty and current job.
+    let _ = send_msg(
+        writer,
+        json!({
+            "id": null,
+            "method": "mining.set_difficulty",
+            "params": [initial_diff]
+        }),
+    )
+    .await;
+
+    if let Some(job) = current_job.read().await.clone() {
+        let (hh, mr) = job.header_hash(&address);
+        let hh_hex = hex::encode(hh);
+        let notify = build_notify(&job, &hh_hex, true);
+        let _ = send_msg(writer, notify).await;
+
+        let mut st = state.lock().await;
+        st.active_jobs.insert(job.id.clone(), (job, hh_hex, mr));
+    }
+
+    json!({"id": id, "result": true, "error": null})
+}
+
+async fn handle_submit(
+    id: Value,
+    params: &Value,
+    state: &Arc<Mutex<MinerState>>,
+    node: &Arc<NodeClient>,
+    db: &Arc<Db>,
+    _writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+) -> Value {
+    // params: [worker_name, job_id, nonce_hex, header_hash_hex, mix_hash_hex]
+    let job_id = params[1].as_str().unwrap_or("").to_string();
+    let nonce_str = params[2].as_str().unwrap_or("").trim_start_matches("0x").to_string();
+    let submitted_hh = params[3].as_str().unwrap_or("").to_string();
+    let mix_hash_hex = params[4].as_str().unwrap_or("").to_string();
+
+    let nonce = match u64::from_str_radix(&nonce_str, 16) {
+        Ok(n) => n,
+        Err(_) => {
+            return json!({"id": id, "result": null, "error": [20, "bad nonce", null]});
+        }
+    };
+
+    let st = state.lock().await;
+    let address = match &st.address {
+        Some(a) => a.clone(),
+        None => return json!({"id": id, "result": null, "error": [24, "not authorized", null]}),
+    };
+
+    let entry = match st.active_jobs.get(&job_id) {
+        Some(e) => e.clone(),
+        None => return json!({"id": id, "result": null, "error": [21, "stale job", null]}),
+    };
+    let diff = st.difficulty;
+    drop(st);
+
+    let (job, hh_hex, merkle_root) = entry;
+
+    // Sanity check header_hash echo.
+    if !submitted_hh.is_empty() && submitted_hh != hh_hex {
+        warn!("Header hash mismatch from miner");
+    }
+
+    // Validate against pool difficulty.
+    let pool_boundary = diff_to_target(diff);
+    let final_hash = match verify::check_share(&hh_hex, &mix_hash_hex, nonce, &pool_boundary) {
+        Some(h) => h,
+        None => {
+            warn!("Invalid share for job {job_id}");
+            return json!({"id": id, "result": null, "error": [23, "low difficulty share", null]});
+        }
+    };
+
+    info!("Valid share: job={job_id} diff={diff}");
+
+    // Check if it also meets network difficulty.
+    let net_final = verify::check_share(&hh_hex, &mix_hash_hex, nonce, &job.network_boundary);
+    if net_final.is_some() {
+        info!("*** BLOCK FOUND by {address} at height {} ***", job.height);
+
+        // Re-derive header prefix from merkle root.
+        let header_prefix = job.build_header_prefix(merkle_root);
+
+        // mix_hash raw = reverse of GetHex.
+        if let Some(mix_raw) = verify::mix_hash_to_raw(&mix_hash_hex) {
+            let block_hex = hex::encode(job.serialize_block(
+                &header_prefix,
+                nonce,
+                &mix_raw,
+                &address,
+            ));
+
+            let final_hash_hex = hex::encode(final_hash);
+
+            match node.submit_block(&block_hex).await {
+                Ok(()) => {
+                    info!("Block submitted! hash={final_hash_hex}");
+                    if let Err(e) = db::log_block(db, job.height, &final_hash_hex, &address).await {
+                        error!("DB log error: {e}");
+                    }
+                }
+                Err(e) => error!("submitblock failed: {e}"),
+            }
+        }
+    }
+
+    json!({"id": id, "result": true, "error": null})
+}
+
+fn build_notify(job: &Job, header_hash_hex: &str, clean: bool) -> Value {
+    json!({
+        "id": null,
+        "method": "mining.notify",
+        "params": [
+            job.id,
+            header_hash_hex,
+            job.seed_hash,
+            hex::encode(job.network_boundary),
+            clean
+        ]
+    })
+}
+
+async fn send_msg(
+    writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    msg: Value,
+) -> Result<()> {
+    let mut w = writer.lock().await;
+    let mut line = serde_json::to_string(&msg)?;
+    line.push('\n');
+    debug!("→ {}", line.trim());
+    w.write_all(line.as_bytes()).await?;
+    Ok(())
+}
+
