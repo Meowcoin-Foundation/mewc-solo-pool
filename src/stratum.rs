@@ -164,6 +164,10 @@ async fn handle_miner(
                 json!({"id": id, "result": true, "error": null})
             }
 
+            "eth_submitHashrate" => {
+                json!({"id": id, "result": true, "error": null})
+            }
+
             other => {
                 warn!("Unknown method: {other}");
                 json!({"id": id, "result": null, "error": [20, "Unknown method", null]})
@@ -252,8 +256,8 @@ async fn handle_submit(
     // params: [worker_name, job_id, nonce_hex, header_hash_hex, mix_hash_hex]
     let job_id = params[1].as_str().unwrap_or("").to_string();
     let nonce_str = params[2].as_str().unwrap_or("").trim_start_matches("0x").to_string();
-    let submitted_hh = params[3].as_str().unwrap_or("").to_string();
-    let mix_hash_hex = params[4].as_str().unwrap_or("").to_string();
+    let submitted_hh = params[3].as_str().unwrap_or("").trim_start_matches("0x").to_string();
+    let mix_hash_hex = params[4].as_str().unwrap_or("").trim_start_matches("0x").to_string();
 
     let nonce = match u64::from_str_radix(&nonce_str, 16) {
         Ok(n) => n,
