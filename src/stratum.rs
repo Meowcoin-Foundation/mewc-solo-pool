@@ -181,8 +181,15 @@ async fn handle_authorize(
     writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     initial_diff: u64,
 ) -> Value {
-    let address = params[0].as_str().unwrap_or("").to_string();
-    let worker = params[1].as_str().unwrap_or("default").to_string();
+    let login = params[0].as_str().unwrap_or("");
+    // Miners often send "address.workername" or "address.workername.password" as one string.
+    let (address, worker_suffix) = login.split_once('.').unwrap_or((login, ""));
+    let address = address.to_string();
+    let worker = if worker_suffix.is_empty() {
+        params[1].as_str().unwrap_or("default").to_string()
+    } else {
+        worker_suffix.split('.').next().unwrap_or("default").to_string()
+    };
 
     info!("Miner authorized: {address}.{worker}");
 
