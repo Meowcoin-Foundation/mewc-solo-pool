@@ -10,6 +10,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::info;
+use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[derive(Debug, Deserialize, Clone)]
@@ -89,50 +90,71 @@ async fn main() -> Result<()> {
         Err(e) => tracing::warn!("Initial GBT failed: {e}"),
     }
 
+    // ZMQ: blocking recv on its own thread, signals an async task via channel.
     {
+        let (zmq_tx, mut zmq_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let zmq_url = cfg.node.zmq_url.clone();
+        tokio::task::spawn_blocking(move || {
+            let ctx = zmq::Context::new();
+            let sock = ctx.socket(zmq::SUB).expect("zmq socket");
+            sock.connect(&zmq_url).expect("zmq connect");
+            sock.set_subscribe(b"hashblock").expect("zmq subscribe");
+            loop {
+                match sock.recv_multipart(0) {
+                    Ok(_) => {
+                        info!("ZMQ: new block");
+                        let _ = zmq_tx.blocking_send(());
+                    }
+                    Err(e) => tracing::error!("ZMQ recv error: {e}"),
+                }
+            }
+        });
+
         let node2 = Arc::clone(&node);
         let job_tx2 = Arc::clone(&job_tx);
         let current_job2 = Arc::clone(&current_job);
-        let zmq_url = cfg.node.zmq_url.clone();
-        tokio::task::spawn_blocking(move || {
-            zmq_listener(zmq_url, node2, current_job2, job_tx2);
+        tokio::spawn(async move {
+            while zmq_rx.recv().await.is_some() {
+                match node2.get_block_template().await {
+                    Ok(tmpl) => {
+                        let j = job::Job::from_template(tmpl);
+                        *current_job2.write().await = Some(j.clone());
+                        let _ = job_tx2.send(j);
+                        info!("ZMQ: job refreshed");
+                    }
+                    Err(e) => tracing::error!("GBT after hashblock failed: {e}"),
+                }
+            }
+        });
+    }
+
+    // Polling fallback: catch any ZMQ misses within 5 s.
+    {
+        let node3 = Arc::clone(&node);
+        let job_tx3 = Arc::clone(&job_tx);
+        let current_job3 = Arc::clone(&current_job);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                match node3.get_block_template().await {
+                    Ok(tmpl) => {
+                        let new_height = tmpl.height;
+                        let cur_height = current_job3.read().await.as_ref().map(|j| j.height);
+                        if cur_height != Some(new_height) {
+                            let j = job::Job::from_template(tmpl);
+                            *current_job3.write().await = Some(j.clone());
+                            let _ = job_tx3.send(j);
+                            info!("Poll: new height {new_height}, job refreshed");
+                        }
+                    }
+                    Err(e) => tracing::warn!("GBT poll failed: {e}"),
+                }
+            }
         });
     }
 
     stratum::serve(cfg.stratum, node, current_job, job_tx, pool).await
 }
 
-fn zmq_listener(
-    zmq_url: String,
-    node: Arc<node::NodeClient>,
-    current_job: SharedJob,
-    job_tx: Arc<broadcast::Sender<job::Job>>,
-) {
-    let ctx = zmq::Context::new();
-    let sock = ctx.socket(zmq::SUB).expect("zmq socket");
-    sock.connect(&zmq_url).expect("zmq connect");
-    sock.set_subscribe(b"hashblock").expect("zmq subscribe");
-
-    loop {
-        match sock.recv_multipart(0) {
-            Ok(_parts) => {
-                let rt = tokio::runtime::Handle::current();
-                let node3 = Arc::clone(&node);
-                let cj = Arc::clone(&current_job);
-                let tx = Arc::clone(&job_tx);
-                rt.block_on(async move {
-                    match node3.get_block_template().await {
-                        Ok(tmpl) => {
-                            let j = job::Job::from_template(tmpl);
-                            *cj.write().await = Some(j.clone());
-                            let _ = tx.send(j);
-                            info!("New block → job refreshed");
-                        }
-                        Err(e) => tracing::error!("GBT after hashblock failed: {e}"),
-                    }
-                });
-            }
-            Err(e) => tracing::error!("ZMQ recv error: {e}"),
-        }
-    }
-}

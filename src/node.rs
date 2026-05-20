@@ -15,7 +15,10 @@ pub struct NodeClient {
 impl NodeClient {
     pub fn new(cfg: &NodeConfig) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("reqwest client"),
             url: cfg.rpc_url.clone(),
             user: cfg.rpc_user.clone(),
             pass: cfg.rpc_pass.clone(),

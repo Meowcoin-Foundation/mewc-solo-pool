@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -50,9 +51,11 @@ struct MinerState {
     worker: String,
     difficulty: u64,
     #[allow(dead_code)]
-    extranonce1: String, // 4-byte hex, pool-assigned nonce prefix
+    extranonce1: String,
     /// job_id → (Job, header_hash_hex, merkle_root)
     active_jobs: HashMap<String, (Job, String, [u8; 32])>,
+    retarget_start: Instant,
+    shares_since_retarget: u32,
 }
 
 impl MinerState {
@@ -63,6 +66,8 @@ impl MinerState {
             difficulty: initial_diff,
             extranonce1,
             active_jobs: HashMap::new(),
+            retarget_start: Instant::now(),
+            shares_since_retarget: 0,
         }
     }
 }
@@ -101,6 +106,10 @@ async fn handle_miner(
                             let notify = build_notify(&job, &hh_hex_str, &pool_target, true);
                             let _ = send_msg(&writer2, notify).await;
                             let mut st2 = state2.lock().await;
+                            // Keep only the two most recent jobs; older ones can't win.
+                            if st2.active_jobs.len() >= 4 {
+                                st2.active_jobs.clear();
+                            }
                             st2.active_jobs.insert(
                                 job.id.clone(),
                                 (job, hh_hex_str, mr),
@@ -251,7 +260,7 @@ async fn handle_submit(
     state: &Arc<Mutex<MinerState>>,
     node: &Arc<NodeClient>,
     db: &Arc<Db>,
-    _writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
 ) -> Value {
     // params: [worker_name, job_id, nonce_hex, header_hash_hex, mix_hash_hex]
     let job_id = params[1].as_str().unwrap_or("").to_string();
@@ -327,6 +336,35 @@ async fn handle_submit(
                 Err(e) => error!("submitblock failed: {e}"),
             }
         }
+    }
+
+    // Vardiff: retarget after 8 shares or 60 s, whichever comes first.
+    let new_diff_opt = {
+        let mut st = state.lock().await;
+        st.shares_since_retarget += 1;
+        let elapsed = st.retarget_start.elapsed().as_secs_f64();
+        if st.shares_since_retarget >= 8 || elapsed >= 60.0 {
+            let avg = elapsed / st.shares_since_retarget as f64;
+            let new_diff = ((st.difficulty as f64 * avg / 30.0) as u64).clamp(1, 1_000_000);
+            st.retarget_start = Instant::now();
+            st.shares_since_retarget = 0;
+            if new_diff != st.difficulty {
+                st.difficulty = new_diff;
+                Some(new_diff)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(new_diff) = new_diff_opt {
+        let _ = send_msg(
+            writer,
+            json!({"id": null, "method": "mining.set_difficulty", "params": [new_diff]}),
+        )
+        .await;
+        info!("Vardiff → {new_diff}");
     }
 
     json!({"id": id, "result": true, "error": null})
