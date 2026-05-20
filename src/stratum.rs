@@ -152,6 +152,11 @@ async fn handle_miner(
                 handle_submit(id, &params, &state, &node, &db, &writer).await
             }
 
+            // Acknowledge but don't support extranonce changes.
+            "mining.extranonce.subscribe" => {
+                json!({"id": id, "result": false, "error": null})
+            }
+
             other => {
                 warn!("Unknown method: {other}");
                 json!({"id": id, "result": null, "error": [20, "Unknown method", null]})
