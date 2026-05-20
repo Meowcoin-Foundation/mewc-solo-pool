@@ -181,7 +181,7 @@ async fn handle_miner(
 fn handle_subscribe(id: Value, extranonce1: &str) -> Value {
     json!({
         "id": id,
-        "result": [["mining.notify", ""], extranonce1, 4],
+        "result": [[["mining.set_difficulty",""],["mining.notify",""]], extranonce1, 4],
         "error": null
     })
 }
@@ -337,7 +337,8 @@ fn build_notify(job: &Job, header_hash_hex: &str, pool_target: &[u8; 32], clean:
             header_hash_hex,
             job.seed_hash,
             hex::encode(pool_target),
-            clean
+            clean,
+            job.height
         ]
     })
 }
