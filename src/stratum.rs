@@ -176,6 +176,15 @@ async fn handle_miner(
                 json!({"id": id, "result": true, "error": null})
             }
 
+            "mining.suggest_difficulty" => {
+                if let Some(suggested) = params[0].as_f64().map(|f| f as u64).filter(|&d| d > 0) {
+                    state.lock().await.difficulty = suggested;
+                    let _ = send_msg(&writer, json!({"id": null, "method": "mining.set_difficulty", "params": [suggested]})).await;
+                    info!("Difficulty set to {suggested} by miner suggestion");
+                }
+                json!({"id": id, "result": true, "error": null})
+            }
+
             "eth_submitHashrate" => {
                 json!({"id": id, "result": true, "error": null})
             }
