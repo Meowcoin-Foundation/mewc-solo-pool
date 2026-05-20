@@ -168,6 +168,12 @@ async fn handle_miner(
                 .await
             }
 
+            // MRR's stratum proxy uses XMRig-style login instead of subscribe+authorize.
+            // Response must include an inline job object or MRR marks the pool offline.
+            "login" => {
+                handle_login(id, &params, &state, &current_job, initial_diff, &fallback_address).await
+            }
+
             "mining.submit" => {
                 handle_submit(id, &params, &state, &node, &db, &writer).await
             }
@@ -201,6 +207,87 @@ async fn handle_miner(
     }
 
     Ok(())
+}
+
+async fn handle_login(
+    id: Value,
+    params: &Value,
+    state: &Arc<Mutex<MinerState>>,
+    current_job: &SharedJob,
+    initial_diff: u64,
+    fallback_address: &Option<String>,
+) -> Value {
+    let login = params["login"].as_str().unwrap_or("");
+    let (raw_address, worker_suffix) = login.split_once('.').unwrap_or((login, ""));
+    let worker = if worker_suffix.is_empty() {
+        params["rigid"].as_str().unwrap_or("default").to_string()
+    } else {
+        worker_suffix.to_string()
+    };
+
+    let address = if bs58::decode(raw_address)
+        .with_alphabet(bs58::Alphabet::BITCOIN)
+        .into_vec()
+        .map(|b| b.len() >= 21)
+        .unwrap_or(false)
+    {
+        raw_address.to_string()
+    } else if let Some(fb) = fallback_address {
+        warn!("Login: invalid address '{raw_address}', using fallback");
+        fb.clone()
+    } else {
+        warn!("Login: invalid address '{raw_address}', no fallback — rejecting");
+        return json!({"id": id, "result": null, "error": [24, "invalid address", null]});
+    };
+
+    let diff = {
+        let mut st = state.lock().await;
+        st.address = Some(address.clone());
+        st.worker = worker.clone();
+        st.difficulty
+    };
+
+    info!("Miner login: {address}.{worker}");
+
+    let pool_target = diff_to_target(diff);
+    let target_hex = hex::encode(pool_target);
+    let session_id = hex::encode(&uuid::Uuid::new_v4().as_bytes()[..8]);
+
+    if let Some(job) = current_job.read().await.clone() {
+        let (hh, mr) = job.header_hash(&address);
+        let hh_hex = hex::encode(hh);
+        {
+            let mut st = state.lock().await;
+            if st.active_jobs.len() >= 4 {
+                st.active_jobs.clear();
+            }
+            st.active_jobs.insert(job.id.clone(), (job.clone(), hh_hex.clone(), mr));
+        }
+        json!({
+            "id": id,
+            "error": null,
+            "result": {
+                "id": session_id,
+                "status": "OK",
+                "job": {
+                    "job_id": job.id,
+                    "seed_hash": job.seed_hash,
+                    "blob": hh_hex,
+                    "target": target_hex
+                }
+            }
+        })
+    } else {
+        json!({
+            "id": id,
+            "error": null,
+            "result": {
+                "id": session_id,
+                "status": "OK",
+                "job": null
+            }
+        })
+    }
 }
 
 fn handle_subscribe(id: Value, extranonce1: &str) -> Value {
@@ -248,11 +335,12 @@ async fn handle_authorize(
 
     info!("Miner authorized: {address}.{worker}");
 
-    {
+    let diff = {
         let mut st = state.lock().await;
         st.address = Some(address.clone());
         st.worker = worker;
-    }
+        st.difficulty // may already be set by a prior mining.suggest_difficulty
+    };
 
     // Send authorize ack first — some miners ignore notifications received before it.
     let _ = send_msg(writer, json!({"id": id, "result": true, "error": null})).await;
@@ -263,7 +351,7 @@ async fn handle_authorize(
         json!({
             "id": null,
             "method": "mining.set_difficulty",
-            "params": [initial_diff]
+            "params": [diff]
         }),
     )
     .await;
@@ -271,7 +359,7 @@ async fn handle_authorize(
     if let Some(job) = current_job.read().await.clone() {
         let (hh, mr) = job.header_hash(&address);
         let hh_hex = hex::encode(hh);
-        let pool_target = diff_to_target(initial_diff);
+        let pool_target = diff_to_target(diff);
         let notify = build_notify(&job, &hh_hex, &pool_target, true);
         let _ = send_msg(writer, notify).await;
 
