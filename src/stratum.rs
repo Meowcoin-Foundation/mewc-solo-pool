@@ -105,7 +105,7 @@ async fn handle_miner(
                             let (hh_bytes, mr) = job.header_hash(&addr_clone);
                             let hh_hex_str = hex::encode(hh_bytes);
                             let pool_target = diff_to_target(diff);
-                            let notify = build_notify(&job, &hh_hex_str, &pool_target, true);
+                            let notify = build_notify(&job, &hh_hex_str, &pool_target, false);
                             let _ = send_msg(&writer2, notify).await;
                             let mut st2 = state2.lock().await;
                             // Keep only the two most recent jobs; older ones can't win.
