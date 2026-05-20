@@ -86,11 +86,15 @@ async fn handle_miner(
             loop {
                 match job_rx.recv().await {
                     Ok(job) => {
-                        let addr_opt = state2.lock().await.address.clone();
+                        let (addr_opt, diff) = {
+                            let st = state2.lock().await;
+                            (st.address.clone(), st.difficulty)
+                        };
                         if let Some(addr_clone) = addr_opt {
                             let (hh_bytes, mr) = job.header_hash(&addr_clone);
                             let hh_hex_str = hex::encode(hh_bytes);
-                            let notify = build_notify(&job, &hh_hex_str, true);
+                            let pool_target = diff_to_target(diff);
+                            let notify = build_notify(&job, &hh_hex_str, &pool_target, true);
                             let _ = send_msg(&writer2, notify).await;
                             let mut st2 = state2.lock().await;
                             st2.active_jobs.insert(
@@ -163,7 +167,9 @@ async fn handle_miner(
             }
         };
 
-        send_msg(&writer, response).await?;
+        if !response.is_null() {
+            send_msg(&writer, response).await?;
+        }
     }
 
     Ok(())
@@ -204,7 +210,10 @@ async fn handle_authorize(
         st.worker = worker;
     }
 
-    // Push difficulty and current job.
+    // Send authorize ack first — some miners ignore notifications received before it.
+    let _ = send_msg(writer, json!({"id": id, "result": true, "error": null})).await;
+
+    // Then push difficulty and current job.
     let _ = send_msg(
         writer,
         json!({
@@ -218,14 +227,16 @@ async fn handle_authorize(
     if let Some(job) = current_job.read().await.clone() {
         let (hh, mr) = job.header_hash(&address);
         let hh_hex = hex::encode(hh);
-        let notify = build_notify(&job, &hh_hex, true);
+        let pool_target = diff_to_target(initial_diff);
+        let notify = build_notify(&job, &hh_hex, &pool_target, true);
         let _ = send_msg(writer, notify).await;
 
         let mut st = state.lock().await;
         st.active_jobs.insert(job.id.clone(), (job, hh_hex, mr));
     }
 
-    json!({"id": id, "result": true, "error": null})
+    // Already sent above — return null so the outer loop skips sending.
+    Value::Null
 }
 
 async fn handle_submit(
@@ -315,7 +326,7 @@ async fn handle_submit(
     json!({"id": id, "result": true, "error": null})
 }
 
-fn build_notify(job: &Job, header_hash_hex: &str, clean: bool) -> Value {
+fn build_notify(job: &Job, header_hash_hex: &str, pool_target: &[u8; 32], clean: bool) -> Value {
     json!({
         "id": null,
         "method": "mining.notify",
@@ -323,7 +334,7 @@ fn build_notify(job: &Job, header_hash_hex: &str, clean: bool) -> Value {
             job.id,
             header_hash_hex,
             job.seed_hash,
-            hex::encode(job.network_boundary),
+            hex::encode(pool_target),
             clean
         ]
     })
