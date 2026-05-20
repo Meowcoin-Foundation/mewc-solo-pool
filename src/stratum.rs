@@ -345,7 +345,7 @@ async fn handle_submit(
         let elapsed = st.retarget_start.elapsed().as_secs_f64();
         if st.shares_since_retarget >= 8 || elapsed >= 60.0 {
             let avg = elapsed / st.shares_since_retarget as f64;
-            let new_diff = ((st.difficulty as f64 * avg / 30.0) as u64).clamp(1, 1_000_000);
+            let new_diff = ((st.difficulty as f64 * 30.0 / avg) as u64).clamp(1, 1_000_000);
             st.retarget_start = Instant::now();
             st.shares_since_retarget = 0;
             if new_diff != st.difficulty {
