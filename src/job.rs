@@ -85,7 +85,7 @@ impl Job {
             .map(p2pkh_script);
 
         let scriptsig = build_coinbase_scriptsig(self.height);
-        let miner_value = self.coinbase_value - self.community_value;
+        let miner_value = self.coinbase_value;
 
         let mut cb = Vec::new();
 
