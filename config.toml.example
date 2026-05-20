@@ -6,7 +6,7 @@ zmq_url  = "tcp://127.0.0.1:28332"
 
 [stratum]
 port               = 3333
-initial_difficulty = 1000
+initial_difficulty = 1
 
 [pool]
 db_path = "blocks.db"

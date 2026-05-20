@@ -49,16 +49,19 @@ struct MinerState {
     address: Option<String>,
     worker: String,
     difficulty: u64,
+    #[allow(dead_code)]
+    extranonce1: String, // 4-byte hex, pool-assigned nonce prefix
     /// job_id → (Job, header_hash_hex, merkle_root)
     active_jobs: HashMap<String, (Job, String, [u8; 32])>,
 }
 
 impl MinerState {
-    fn new(initial_diff: u64) -> Self {
+    fn new(initial_diff: u64, extranonce1: String) -> Self {
         Self {
             address: None,
             worker: String::new(),
             difficulty: initial_diff,
+            extranonce1,
             active_jobs: HashMap::new(),
         }
     }
@@ -76,7 +79,8 @@ async fn handle_miner(
     let mut reader = BufReader::new(reader);
     let writer = Arc::new(Mutex::new(writer));
 
-    let state = Arc::new(Mutex::new(MinerState::new(initial_diff)));
+    let extranonce1 = hex::encode(&uuid::Uuid::new_v4().as_bytes()[..4]);
+    let state = Arc::new(Mutex::new(MinerState::new(initial_diff, extranonce1.clone())));
 
     // Spawn task to push new jobs as they arrive.
     {
@@ -138,7 +142,7 @@ async fn handle_miner(
         let params = msg["params"].clone();
 
         let response = match method.as_str() {
-            "mining.subscribe" => handle_subscribe(id),
+            "mining.subscribe" => handle_subscribe(id, &extranonce1),
 
             "mining.authorize" => {
                 handle_authorize(
@@ -156,9 +160,8 @@ async fn handle_miner(
                 handle_submit(id, &params, &state, &node, &db, &writer).await
             }
 
-            // Acknowledge but don't support extranonce changes.
             "mining.extranonce.subscribe" => {
-                json!({"id": id, "result": false, "error": null})
+                json!({"id": id, "result": true, "error": null})
             }
 
             other => {
@@ -175,11 +178,10 @@ async fn handle_miner(
     Ok(())
 }
 
-fn handle_subscribe(id: Value) -> Value {
-    let session_id = hex::encode(uuid::Uuid::new_v4().as_bytes());
+fn handle_subscribe(id: Value, extranonce1: &str) -> Value {
     json!({
         "id": id,
-        "result": [null, session_id],
+        "result": [["mining.notify", ""], extranonce1, 4],
         "error": null
     })
 }
