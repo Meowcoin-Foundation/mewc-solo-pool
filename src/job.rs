@@ -411,12 +411,16 @@ fn encode_height(h: u32) -> Vec<u8> {
 }
 
 fn p2pkh_script(address: &str) -> Vec<u8> {
-    let decoded = bs58::decode(address)
+    let decoded = match bs58::decode(address)
         .with_alphabet(bs58::Alphabet::BITCOIN)
         .into_vec()
-        .expect("base58 decode");
-    // decoded = version_byte(1) + hash160(20) + checksum(4)
-    assert!(decoded.len() >= 21, "short address decode");
+    {
+        Ok(b) if b.len() >= 21 => b,
+        _ => {
+            tracing::error!("p2pkh_script: invalid address '{address}'");
+            return vec![0u8; 25];
+        }
+    };
     let hash160 = &decoded[1..21];
     let mut script = Vec::with_capacity(25);
     script.push(0x76); // OP_DUP

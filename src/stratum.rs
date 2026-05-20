@@ -37,9 +37,10 @@ pub async fn serve(
         let rx = job_tx.subscribe();
         let db2 = Arc::clone(&db);
         let initial_diff = cfg.initial_difficulty;
+        let fallback_address = cfg.fallback_address.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_miner(stream, node2, cj, rx, db2, initial_diff).await {
+            if let Err(e) = handle_miner(stream, node2, cj, rx, db2, initial_diff, fallback_address).await {
                 warn!("Miner {peer} disconnected: {e}");
             }
         });
@@ -79,6 +80,7 @@ async fn handle_miner(
     mut job_rx: broadcast::Receiver<Job>,
     db: Arc<Db>,
     initial_diff: u64,
+    fallback_address: Option<String>,
 ) -> Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -161,6 +163,7 @@ async fn handle_miner(
                     &current_job,
                     &writer,
                     initial_diff,
+                    &fallback_address,
                 )
                 .await
             }
@@ -206,15 +209,32 @@ async fn handle_authorize(
     current_job: &SharedJob,
     writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     initial_diff: u64,
+    fallback_address: &Option<String>,
 ) -> Value {
     let login = params[0].as_str().unwrap_or("");
     // Miners often send "address.workername" or "address.workername.password" as one string.
-    let (address, worker_suffix) = login.split_once('.').unwrap_or((login, ""));
-    let address = address.to_string();
+    let (raw_address, worker_suffix) = login.split_once('.').unwrap_or((login, ""));
     let worker = if worker_suffix.is_empty() {
         params[1].as_str().unwrap_or("default").to_string()
     } else {
         worker_suffix.split('.').next().unwrap_or("default").to_string()
+    };
+
+    // Validate that the address is a real base58 MEWC address.
+    let address = if bs58::decode(raw_address)
+        .with_alphabet(bs58::Alphabet::BITCOIN)
+        .into_vec()
+        .map(|b| b.len() >= 21)
+        .unwrap_or(false)
+    {
+        raw_address.to_string()
+    } else if let Some(fb) = fallback_address {
+        warn!("Invalid address '{raw_address}', using fallback");
+        fb.clone()
+    } else {
+        warn!("Invalid address '{raw_address}', no fallback configured — rejecting");
+        let _ = send_msg(writer, json!({"id": id, "result": null, "error": [24, "invalid address", null]})).await;
+        return Value::Null;
     };
 
     info!("Miner authorized: {address}.{worker}");

@@ -25,6 +25,8 @@ pub struct NodeConfig {
 pub struct StratumConfig {
     pub port: u16,
     pub initial_difficulty: u64,
+    /// Fallback MEWC address used when a miner provides an invalid address (e.g. MRR test probes).
+    pub fallback_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
