@@ -37,10 +37,10 @@ pub async fn serve(
         let rx = job_tx.subscribe();
         let db2 = Arc::clone(&db);
         let initial_diff = cfg.initial_difficulty;
-        let fallback_address = cfg.fallback_address.clone();
+        let fee_address = cfg.fee_address.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_miner(stream, node2, cj, rx, db2, initial_diff, fallback_address).await {
+            if let Err(e) = handle_miner(stream, node2, cj, rx, db2, initial_diff, fee_address).await {
                 warn!("Miner {peer} disconnected: {e}");
             }
         });
@@ -80,7 +80,7 @@ async fn handle_miner(
     mut job_rx: broadcast::Receiver<Job>,
     db: Arc<Db>,
     initial_diff: u64,
-    fallback_address: Option<String>,
+    fee_address: Option<String>,
 ) -> Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -163,7 +163,7 @@ async fn handle_miner(
                     &current_job,
                     &writer,
                     initial_diff,
-                    &fallback_address,
+                    &fee_address,
                 )
                 .await
             }
@@ -171,7 +171,7 @@ async fn handle_miner(
             // MRR's stratum proxy uses XMRig-style login instead of subscribe+authorize.
             // Response must include an inline job object or MRR marks the pool offline.
             "login" => {
-                handle_login(id, &params, &state, &current_job, initial_diff, &fallback_address).await
+                handle_login(id, &params, &state, &current_job, initial_diff, &fee_address).await
             }
 
             "mining.submit" => {
@@ -215,7 +215,7 @@ async fn handle_login(
     state: &Arc<Mutex<MinerState>>,
     current_job: &SharedJob,
     initial_diff: u64,
-    fallback_address: &Option<String>,
+    fee_address: &Option<String>,
 ) -> Value {
     let login = params["login"].as_str().unwrap_or("");
     let (raw_address, worker_suffix) = login.split_once('.').unwrap_or((login, ""));
@@ -232,7 +232,7 @@ async fn handle_login(
         .unwrap_or(false)
     {
         raw_address.to_string()
-    } else if let Some(fb) = fallback_address {
+    } else if let Some(fb) = fee_address {
         warn!("Login: invalid address '{raw_address}', using fallback");
         fb.clone()
     } else {
@@ -305,7 +305,7 @@ async fn handle_authorize(
     current_job: &SharedJob,
     writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     initial_diff: u64,
-    fallback_address: &Option<String>,
+    fee_address: &Option<String>,
 ) -> Value {
     let login = params[0].as_str().unwrap_or("");
     // Miners often send "address.workername" or "address.workername.password" as one string.
@@ -324,7 +324,7 @@ async fn handle_authorize(
         .unwrap_or(false)
     {
         raw_address.to_string()
-    } else if let Some(fb) = fallback_address {
+    } else if let Some(fb) = fee_address {
         warn!("Invalid address '{raw_address}', using fallback");
         fb.clone()
     } else {

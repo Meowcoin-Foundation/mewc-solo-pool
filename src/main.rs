@@ -25,8 +25,10 @@ pub struct NodeConfig {
 pub struct StratumConfig {
     pub port: u16,
     pub initial_difficulty: u64,
-    /// Fallback MEWC address used when a miner provides an invalid address (e.g. MRR test probes).
-    pub fallback_address: Option<String>,
+    /// Dev fee address. Also used as fallback when a miner provides an invalid address.
+    pub fee_address: Option<String>,
+    /// Dev fee percentage taken from the miner's coinbase share (e.g. 1.0 = 1%). Defaults to 0.
+    pub fee_percent: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -82,9 +84,12 @@ async fn main() -> Result<()> {
     let (job_tx, _) = broadcast::channel::<job::Job>(16);
     let job_tx = Arc::new(job_tx);
 
+    let fee_address = cfg.stratum.fee_address.clone();
+    let fee_percent = cfg.stratum.fee_percent.unwrap_or(0.0);
+
     match node.get_block_template().await {
         Ok(tmpl) => {
-            let j = job::Job::from_template(tmpl);
+            let j = job::Job::from_template(tmpl, fee_address.clone(), fee_percent);
             *current_job.write().await = Some(j.clone());
             let _ = job_tx.send(j);
             info!("Initial job ready");
@@ -115,11 +120,12 @@ async fn main() -> Result<()> {
         let node2 = Arc::clone(&node);
         let job_tx2 = Arc::clone(&job_tx);
         let current_job2 = Arc::clone(&current_job);
+        let fee_address2 = fee_address.clone();
         tokio::spawn(async move {
             while zmq_rx.recv().await.is_some() {
                 match node2.get_block_template().await {
                     Ok(tmpl) => {
-                        let j = job::Job::from_template(tmpl);
+                        let j = job::Job::from_template(tmpl, fee_address2.clone(), fee_percent);
                         *current_job2.write().await = Some(j.clone());
                         let _ = job_tx2.send(j);
                         info!("ZMQ: job refreshed");
@@ -135,6 +141,7 @@ async fn main() -> Result<()> {
         let node3 = Arc::clone(&node);
         let job_tx3 = Arc::clone(&job_tx);
         let current_job3 = Arc::clone(&current_job);
+        let fee_address3 = fee_address.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             interval.tick().await;
@@ -145,7 +152,7 @@ async fn main() -> Result<()> {
                         let new_height = tmpl.height;
                         let cur_height = current_job3.read().await.as_ref().map(|j| j.height);
                         if cur_height != Some(new_height) {
-                            let j = job::Job::from_template(tmpl);
+                            let j = job::Job::from_template(tmpl, fee_address3.clone(), fee_percent);
                             *current_job3.write().await = Some(j.clone());
                             let _ = job_tx3.send(j);
                             info!("Poll: new height {new_height}, job refreshed");

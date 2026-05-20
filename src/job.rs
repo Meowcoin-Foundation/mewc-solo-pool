@@ -21,10 +21,12 @@ pub struct Job {
     pub tx_wtxids: Vec<[u8; 32]>, // wtxids for witness merkle (raw LE)
     pub network_boundary: [u8; 32], // 32-byte target derived from bits
     pub seed_hash: String,      // 32 bytes hex (epoch seed, human-readable)
+    pub fee_address: Option<String>,
+    pub fee_percent: f64,
 }
 
 impl Job {
-    pub fn from_template(t: BlockTemplate) -> Self {
+    pub fn from_template(t: BlockTemplate, fee_address: Option<String>, fee_percent: f64) -> Self {
         let bits = u32::from_str_radix(&t.bits, 16).expect("bits hex");
         let network_boundary = bits_to_target(bits);
 
@@ -72,6 +74,8 @@ impl Job {
             tx_wtxids,
             network_boundary,
             seed_hash,
+            fee_address,
+            fee_percent,
         }
     }
 
@@ -85,7 +89,18 @@ impl Job {
             .map(p2pkh_script);
 
         let scriptsig = build_coinbase_scriptsig(self.height);
-        let miner_value = self.coinbase_value;
+
+        let fee_script = if self.fee_percent > 0.0 {
+            self.fee_address.as_deref().map(p2pkh_script)
+        } else {
+            None
+        };
+        let fee_value = if fee_script.is_some() {
+            (self.coinbase_value as f64 * self.fee_percent / 100.0) as u64
+        } else {
+            0
+        };
+        let miner_value = self.coinbase_value - fee_value;
 
         let mut cb = Vec::new();
 
@@ -109,6 +124,7 @@ impl Job {
         // outputs
         let mut num_outputs: u8 = 1;
         if community_script.is_some() { num_outputs += 1; }
+        if fee_script.is_some() { num_outputs += 1; }
         if self.witness_commitment_script.is_some() { num_outputs += 1; }
         cb.push(num_outputs);
 
@@ -119,6 +135,12 @@ impl Job {
         // vout[1]: community fund (must be index 1 per Meowcoin consensus)
         if let Some(script) = &community_script {
             cb.extend_from_slice(&self.community_value.to_le_bytes());
+            push_var_bytes(&mut cb, script);
+        }
+
+        // vout[2]: dev fee
+        if let Some(script) = &fee_script {
+            cb.extend_from_slice(&fee_value.to_le_bytes());
             push_var_bytes(&mut cb, script);
         }
 

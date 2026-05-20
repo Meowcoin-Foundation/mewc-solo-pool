@@ -7,7 +7,10 @@ zmq_url  = "tcp://127.0.0.1:28332"
 [stratum]
 port               = 3333
 initial_difficulty = 1
-# fallback_address = "MYADDRESS"  # used when a miner sends an invalid address (e.g. pool tester probes)
+# fee_address: receives the dev fee on every block found, and also acts as the
+# fallback address for miners that send an invalid address (pool testers, probes).
+fee_address = "M94MsdkF4WPaGCvEUMyqhTB32ogBazrzPG"
+fee_percent = 1
 
 [pool]
 db_path = "blocks.db"
