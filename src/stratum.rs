@@ -165,14 +165,6 @@ async fn handle_miner(
                 .await
             }
 
-            // Some GPU rental clients (e.g. NiceHash) send login instead of
-            // subscribe+authorize. Params is an object: {"login":"addr.worker","pass":"x"}.
-            "login" => {
-                let login = params["login"].as_str().unwrap_or("");
-                let synthetic = json!([login, params["pass"].as_str().unwrap_or("x")]);
-                handle_authorize(id, &synthetic, &state, &current_job, &writer, initial_diff).await
-            }
-
             "mining.submit" => {
                 handle_submit(id, &params, &state, &node, &db, &writer).await
             }
