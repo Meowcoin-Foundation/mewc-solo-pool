@@ -72,27 +72,38 @@ CREATE INDEX IF NOT EXISTS meowpow_miner_sessions_active       ON meowpow_miner_
 -- Pre-built queries the frontend can hit directly.
 -- ============================================================
 
--- Current pool hashrate and active miner count (last 5 minutes of share windows)
+-- Current pool hashrate and active miner count.
+-- AVG per worker (instantaneous rate), then SUM across workers for pool total.
 CREATE OR REPLACE VIEW meowpow_pool_stats AS
 SELECT
-    COUNT(DISTINCT address)        AS active_miners,
-    COALESCE(SUM(hashrate_mhs), 0) AS pool_hashrate_mhs,
-    COUNT(*)                       AS meowpow_share_windows_count
-FROM meowpow_share_windows
-WHERE window_end > now() - INTERVAL '5 minutes';
+    COUNT(*)                        AS active_miners,
+    COALESCE(SUM(hashrate_mhs), 0)  AS pool_hashrate_mhs
+FROM (
+    SELECT address, worker, AVG(NULLIF(hashrate_mhs, 0)) AS hashrate_mhs
+    FROM meowpow_share_windows
+    WHERE window_end > now() - INTERVAL '10 minutes'
+    GROUP BY address, worker
+) w;
 
--- Per-miner hashrate leaderboard (last 10 minutes)
+-- Per-miner/worker hashrate. Anchored on open sessions so both workers under
+-- one address always appear, even if a flush hasn't landed yet.
 CREATE OR REPLACE VIEW meowpow_miner_hashrates AS
 SELECT
-    address,
-    worker,
-    COALESCE(SUM(hashrate_mhs), 0)   AS hashrate_mhs,
-    SUM(shares_valid)                 AS shares_valid,
-    SUM(shares_invalid)               AS shares_invalid,
-    MAX(window_end)                   AS last_share_at
-FROM meowpow_share_windows
-WHERE window_end > now() - INTERVAL '10 minutes'
-GROUP BY address, worker
+    s.address,
+    s.worker,
+    COALESCE(AVG(NULLIF(sw.hashrate_mhs, 0)), 0) AS hashrate_mhs,
+    COALESCE(SUM(sw.shares_valid), 0)   AS shares_valid,
+    COALESCE(SUM(sw.shares_invalid), 0) AS shares_invalid,
+    MAX(sw.window_end)                  AS last_share_at,
+    TRUE                                AS is_online
+FROM meowpow_miner_sessions s
+LEFT JOIN meowpow_share_windows sw
+    ON  sw.address    = s.address
+    AND sw.worker     = s.worker
+    AND sw.window_end > now() - INTERVAL '30 minutes'
+WHERE s.disconnected_at IS NULL
+  AND sw.window_end IS NOT NULL
+GROUP BY s.address, s.worker
 ORDER BY hashrate_mhs DESC;
 
 -- Pool luck: actual meowpow_blocks vs expected based on shares submitted
@@ -104,6 +115,30 @@ SELECT
     (SELECT SUM(shares_valid)                 FROM meowpow_share_windows)  AS total_shares,
     (SELECT SUM(shares_valid * difficulty_avg) FROM meowpow_share_windows) AS total_work,
     (SELECT MIN(found_at)                     FROM meowpow_blocks)         AS since;
+
+-- Historical pool hashrate, time-bucketed for charting.
+-- AVG per worker per bucket, then SUM across workers = pool rate for that period.
+-- Usage: SELECT * FROM meowpow_pool_hashrate_history(24, 5);
+CREATE OR REPLACE FUNCTION meowpow_pool_hashrate_history(hours int DEFAULT 24, bucket_minutes int DEFAULT 5)
+RETURNS TABLE (bucket timestamptz, pool_hashrate_mhs numeric) AS $$
+SELECT
+    time_bucket,
+    SUM(avg_hashrate) AS pool_hashrate_mhs
+FROM (
+    SELECT
+        date_trunc('minute', window_end)
+            - ((EXTRACT(MINUTE FROM window_end)::int % bucket_minutes) * INTERVAL '1 minute')
+            AS time_bucket,
+        address,
+        worker,
+        AVG(NULLIF(hashrate_mhs, 0)) AS avg_hashrate
+    FROM meowpow_share_windows
+    WHERE window_end > now() - (hours * INTERVAL '1 hour')
+    GROUP BY time_bucket, address, worker
+) sub
+GROUP BY time_bucket
+ORDER BY time_bucket ASC;
+$$ LANGUAGE sql STABLE;
 
 -- ============================================================
 -- ROW LEVEL SECURITY

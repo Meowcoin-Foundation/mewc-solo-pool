@@ -563,13 +563,14 @@ async fn handle_submit(
     }
 
     // Vardiff: retarget after 8 shares or 60 s, whichever comes first.
+    // Target 10 s/share → ~6 shares per 60 s window, keeping hashrate estimates stable.
     let new_diff_opt = {
         let mut st = state.lock().await;
         st.shares_since_retarget += 1;
         let elapsed = st.retarget_start.elapsed().as_secs_f64();
         if st.shares_since_retarget >= 8 || elapsed >= 60.0 {
             let avg = elapsed / st.shares_since_retarget as f64;
-            let new_diff = ((st.difficulty as f64 * 30.0 / avg) as u64).clamp(1, 1_000_000);
+            let new_diff = ((st.difficulty as f64 * 10.0 / avg) as u64).clamp(1, 1_000_000);
             st.retarget_start = Instant::now();
             st.shares_since_retarget = 0;
             if new_diff != st.difficulty {
