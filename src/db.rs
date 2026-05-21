@@ -10,13 +10,14 @@ pub struct Db {
     client: Client,
     base_url: String,
     service_key: String,
+    server_id: String,
     last_block_at: Mutex<Option<SystemTime>>,
 }
 
 pub type SharedDb = Arc<Db>;
 
 impl Db {
-    pub fn new(base_url: String, service_key: String) -> SharedDb {
+    pub fn new(base_url: String, service_key: String, server_id: String) -> SharedDb {
         Arc::new(Self {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
@@ -24,6 +25,7 @@ impl Db {
                 .expect("reqwest client"),
             base_url: base_url.trim_end_matches('/').to_string(),
             service_key,
+            server_id,
             last_block_at: Mutex::new(None),
         })
     }
@@ -76,6 +78,17 @@ impl Db {
         Ok(())
     }
 
+    /// On startup: close any sessions this server left open from a previous run.
+    /// Uses server_id so we never touch another server's live sessions.
+    pub async fn close_stale_sessions(&self) -> Result<()> {
+        self.patch(
+            "meowpow_miner_sessions",
+            &format!("disconnected_at=is.null&server_id=eq.{}", self.server_id),
+            json!({ "disconnected_at": Utc::now().to_rfc3339() }),
+        )
+        .await
+    }
+
     pub async fn log_block(
         &self,
         height: u32,
@@ -123,9 +136,10 @@ impl Db {
             .post(
                 "meowpow_miner_sessions",
                 json!({
-                    "address": address,
-                    "worker":  worker,
-                    "ip":      ip,
+                    "address":   address,
+                    "worker":    worker,
+                    "ip":        ip,
+                    "server_id": self.server_id,
                 }),
                 "return=representation",
             )
@@ -162,15 +176,15 @@ impl Db {
         self.post(
             "meowpow_share_windows",
             json!({
-                "address":       address,
-                "worker":        worker,
-                "window_start":  to_rfc(window_start),
-                "window_end":    to_rfc(window_end),
-                "shares_valid":  shares_valid,
+                "address":        address,
+                "worker":         worker,
+                "window_start":   to_rfc(window_start),
+                "window_end":     to_rfc(window_end),
+                "shares_valid":   shares_valid,
                 "shares_invalid": shares_invalid,
-                "shares_stale":  shares_stale,
+                "shares_stale":   shares_stale,
                 "difficulty_avg": difficulty_avg,
-                "hashrate_mhs":  hashrate_mhs,
+                "hashrate_mhs":   hashrate_mhs,
             }),
             "return=minimal",
         )

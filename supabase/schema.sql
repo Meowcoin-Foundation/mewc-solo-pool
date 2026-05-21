@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS meowpow_miner_sessions (
     address          text        NOT NULL,
     worker           text        NOT NULL DEFAULT '',
     ip               text        NOT NULL,
+    server_id        text        NOT NULL DEFAULT '',
     connected_at     timestamptz NOT NULL DEFAULT now(),
     disconnected_at  timestamptz          -- null means currently connected
 );
@@ -85,25 +86,21 @@ FROM (
     GROUP BY address, worker
 ) w;
 
--- Per-miner/worker hashrate. Anchored on open sessions so both workers under
--- one address always appear, even if a flush hasn't landed yet.
+-- Per-miner/worker hashrate. Driven purely by recent share activity —
+-- no session join, so multiple servers and restarts don't cause ghost entries.
+-- A miner appears here only if they have produced work in the last 15 minutes.
 CREATE OR REPLACE VIEW meowpow_miner_hashrates AS
 SELECT
-    s.address,
-    s.worker,
-    COALESCE(AVG(NULLIF(sw.hashrate_mhs, 0)), 0) AS hashrate_mhs,
-    COALESCE(SUM(sw.shares_valid), 0)   AS shares_valid,
-    COALESCE(SUM(sw.shares_invalid), 0) AS shares_invalid,
-    MAX(sw.window_end)                  AS last_share_at,
-    TRUE                                AS is_online
-FROM meowpow_miner_sessions s
-LEFT JOIN meowpow_share_windows sw
-    ON  sw.address    = s.address
-    AND sw.worker     = s.worker
-    AND sw.window_end > now() - INTERVAL '30 minutes'
-WHERE s.disconnected_at IS NULL
-  AND sw.window_end IS NOT NULL
-GROUP BY s.address, s.worker
+    address,
+    worker,
+    COALESCE(AVG(NULLIF(hashrate_mhs, 0)), 0) AS hashrate_mhs,
+    COALESCE(SUM(shares_valid), 0)             AS shares_valid,
+    COALESCE(SUM(shares_invalid), 0)           AS shares_invalid,
+    MAX(window_end)                            AS last_share_at,
+    TRUE                                       AS is_online
+FROM meowpow_share_windows
+WHERE window_end > now() - INTERVAL '15 minutes'
+GROUP BY address, worker
 ORDER BY hashrate_mhs DESC;
 
 -- Pool luck: actual meowpow_blocks vs expected based on shares submitted

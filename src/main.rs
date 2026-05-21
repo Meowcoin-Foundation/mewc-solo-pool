@@ -76,12 +76,15 @@ async fn main() -> Result<()> {
         .build()?
         .try_deserialize()?;
 
-    info!("Starting MEWC solo pool on stratum port {}", cfg.stratum.port);
+    let server_id = uuid::Uuid::new_v4().to_string();
+    info!("Starting MEWC solo pool on stratum port {} (server_id={})", cfg.stratum.port, server_id);
 
     let pool = db::Db::new(
         cfg.pool.supabase_url.clone(),
         cfg.pool.supabase_service_key.clone(),
+        server_id.clone(),
     );
+    pool.close_stale_sessions().await;
     let node = Arc::new(node::NodeClient::new(&cfg.node));
     let current_job: SharedJob = Arc::new(RwLock::new(None));
 
