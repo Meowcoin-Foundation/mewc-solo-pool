@@ -100,12 +100,10 @@ ORDER BY hashrate_mhs DESC;
 -- Network difficulty is not stored here — compute in the frontend or pass as param.
 CREATE OR REPLACE VIEW meowpow_pool_luck AS
 SELECT
-    COUNT(*)                      AS meowpow_blocks_found,
-    SUM(shares_valid)             AS total_shares,
-    SUM(shares_valid * difficulty_avg) AS total_work,
-    MIN(found_at)                 AS since
-FROM meowpow_blocks b
-LEFT JOIN meowpow_share_windows sw ON sw.window_start >= (SELECT MIN(found_at) FROM meowpow_blocks);
+    (SELECT COUNT(*)                          FROM meowpow_blocks)         AS meowpow_blocks_found,
+    (SELECT SUM(shares_valid)                 FROM meowpow_share_windows)  AS total_shares,
+    (SELECT SUM(shares_valid * difficulty_avg) FROM meowpow_share_windows) AS total_work,
+    (SELECT MIN(found_at)                     FROM meowpow_blocks)         AS since;
 
 -- ============================================================
 -- ROW LEVEL SECURITY
