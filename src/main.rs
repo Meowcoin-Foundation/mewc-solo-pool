@@ -33,7 +33,8 @@ pub struct StratumConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PoolConfig {
-    pub db_path: String,
+    pub supabase_url: String,
+    pub supabase_service_key: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -77,7 +78,10 @@ async fn main() -> Result<()> {
 
     info!("Starting MEWC solo pool on stratum port {}", cfg.stratum.port);
 
-    let pool = db::init(&cfg.pool.db_path).await?;
+    let pool = db::Db::new(
+        cfg.pool.supabase_url.clone(),
+        cfg.pool.supabase_service_key.clone(),
+    );
     let node = Arc::new(node::NodeClient::new(&cfg.node));
     let current_job: SharedJob = Arc::new(RwLock::new(None));
 

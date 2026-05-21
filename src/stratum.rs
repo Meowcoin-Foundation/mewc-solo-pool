@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex};
+use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::db::{self, Db};
+use crate::db::Db;
 use crate::job::{diff_to_target, Job};
 use crate::node::NodeClient;
 use crate::verify;
@@ -20,13 +21,11 @@ pub async fn serve(
     node: Arc<NodeClient>,
     current_job: SharedJob,
     job_tx: Arc<broadcast::Sender<Job>>,
-    db: Db,
+    db: Arc<Db>,
 ) -> Result<()> {
     let addr = format!("0.0.0.0:{}", cfg.port);
     let listener = TcpListener::bind(&addr).await?;
     info!("Stratum listening on {addr}");
-
-    let db = Arc::new(db);
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -38,12 +37,51 @@ pub async fn serve(
         let db2 = Arc::clone(&db);
         let initial_diff = cfg.initial_difficulty;
         let fee_address = cfg.fee_address.clone();
+        let peer_ip = peer.ip().to_string();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_miner(stream, node2, cj, rx, db2, initial_diff, fee_address).await {
+            if let Err(e) = handle_miner(stream, node2, cj, rx, db2, initial_diff, fee_address, peer_ip).await {
                 warn!("Miner {peer} disconnected: {e}");
             }
         });
+    }
+}
+
+#[derive(Clone)]
+struct ShareAggregate {
+    window_start: SystemTime,
+    shares_valid: u32,
+    shares_invalid: u32,
+    shares_stale: u32,
+    difficulty_sum: f64,
+}
+
+impl ShareAggregate {
+    fn new() -> Self {
+        Self {
+            window_start: SystemTime::now(),
+            shares_valid: 0,
+            shares_invalid: 0,
+            shares_stale: 0,
+            difficulty_sum: 0.0,
+        }
+    }
+
+    fn hashrate_mhs(&self, window_end: SystemTime) -> f64 {
+        let elapsed = window_end
+            .duration_since(self.window_start)
+            .unwrap_or_default()
+            .as_secs_f64();
+        if elapsed <= 0.0 || self.shares_valid == 0 {
+            return 0.0;
+        }
+        let avg_diff = self.difficulty_sum / self.shares_valid as f64;
+        // hashrate = shares * difficulty * 2^32 / elapsed / 1e6 (MH/s)
+        (self.shares_valid as f64 * avg_diff * 4_294_967_296.0) / elapsed / 1_000_000.0
+    }
+
+    fn difficulty_avg(&self) -> f64 {
+        if self.shares_valid == 0 { 1.0 } else { self.difficulty_sum / self.shares_valid as f64 }
     }
 }
 
@@ -57,6 +95,8 @@ struct MinerState {
     active_jobs: HashMap<String, (Job, String, [u8; 32])>,
     retarget_start: Instant,
     shares_since_retarget: u32,
+    share_agg: ShareAggregate,
+    db_session_id: Option<i64>,
 }
 
 impl MinerState {
@@ -69,6 +109,8 @@ impl MinerState {
             active_jobs: HashMap::new(),
             retarget_start: Instant::now(),
             shares_since_retarget: 0,
+            share_agg: ShareAggregate::new(),
+            db_session_id: None,
         }
     }
 }
@@ -81,6 +123,7 @@ async fn handle_miner(
     db: Arc<Db>,
     initial_diff: u64,
     fee_address: Option<String>,
+    peer_ip: String,
 ) -> Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -108,19 +151,13 @@ async fn handle_miner(
                             let notify = build_notify(&job, &hh_hex_str, &pool_target, true);
                             let _ = send_msg(&writer2, notify).await;
                             let mut st2 = state2.lock().await;
-                            // Keep only the two most recent jobs; older ones can't win.
                             if st2.active_jobs.len() >= 4 {
                                 st2.active_jobs.clear();
                             }
-                            st2.active_jobs.insert(
-                                job.id.clone(),
-                                (job, hh_hex_str, mr),
-                            );
+                            st2.active_jobs.insert(job.id.clone(), (job, hh_hex_str, mr));
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Job broadcast lagged by {n}");
-                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => warn!("Job broadcast lagged by {n}"),
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -128,85 +165,112 @@ async fn handle_miner(
     }
 
     let mut line = String::new();
+    let mut flush_interval = tokio::time::interval(Duration::from_secs(60));
+    flush_interval.tick().await; // skip immediate first tick
+
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break; // EOF
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        debug!("← {trimmed}");
+        tokio::select! {
+            result = reader.read_line(&mut line) => {
+                let n = result?;
+                if n == 0 { break; }
+                let trimmed = line.trim();
+                if trimmed.is_empty() { continue; }
+                debug!("← {trimmed}");
 
-        let msg: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("JSON parse error: {e}");
-                continue;
-            }
-        };
+                let msg: Value = match serde_json::from_str(trimmed) {
+                    Ok(v) => v,
+                    Err(e) => { warn!("JSON parse error: {e}"); continue; }
+                };
 
-        let id = msg.get("id").cloned().unwrap_or(Value::Null);
-        let method = msg["method"].as_str().unwrap_or("").to_string();
-        let params = msg["params"].clone();
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                let method = msg["method"].as_str().unwrap_or("").to_string();
+                let params = msg["params"].clone();
 
-        let response = match method.as_str() {
-            "mining.subscribe" => handle_subscribe(id, &extranonce1),
+                let response = match method.as_str() {
+                    "mining.subscribe" => handle_subscribe(id, &extranonce1),
 
-            "mining.authorize" => {
-                handle_authorize(
-                    id,
-                    &params,
-                    &state,
-                    &current_job,
-                    &writer,
-                    initial_diff,
-                    &fee_address,
-                )
-                .await
-            }
+                    "mining.authorize" => {
+                        handle_authorize(id, &params, &state, &current_job, &writer, initial_diff, &fee_address, &db, &peer_ip).await
+                    }
 
-            // MRR's stratum proxy uses XMRig-style login instead of subscribe+authorize.
-            // Response must include an inline job object or MRR marks the pool offline.
-            "login" => {
-                handle_login(id, &params, &state, &current_job, initial_diff, &fee_address).await
-            }
+                    "login" => {
+                        handle_login(id, &params, &state, &current_job, initial_diff, &fee_address, &db, &peer_ip).await
+                    }
 
-            "mining.submit" => {
-                handle_submit(id, &params, &state, &node, &db, &writer).await
-            }
+                    "mining.submit" => {
+                        handle_submit(id, &params, &state, &node, &db, &writer).await
+                    }
 
-            "mining.extranonce.subscribe" => {
-                json!({"id": id, "result": true, "error": null})
-            }
+                    "mining.extranonce.subscribe" => {
+                        json!({"id": id, "result": true, "error": null})
+                    }
 
-            "mining.suggest_difficulty" => {
-                if let Some(suggested) = params[0].as_f64().map(|f| f as u64).filter(|&d| d > 0) {
-                    state.lock().await.difficulty = suggested;
-                    let _ = send_msg(&writer, json!({"id": null, "method": "mining.set_difficulty", "params": [suggested]})).await;
-                    info!("Difficulty set to {suggested} by miner suggestion");
+                    "mining.suggest_difficulty" => {
+                        if let Some(suggested) = params[0].as_f64().map(|f| f as u64).filter(|&d| d > 0) {
+                            state.lock().await.difficulty = suggested;
+                            let _ = send_msg(&writer, json!({"id": null, "method": "mining.set_difficulty", "params": [suggested]})).await;
+                            info!("Difficulty set to {suggested} by miner suggestion");
+                        }
+                        json!({"id": id, "result": true, "error": null})
+                    }
+
+                    "eth_submitHashrate" => json!({"id": id, "result": true, "error": null}),
+
+                    other => {
+                        warn!("Unknown method: {other}");
+                        json!({"id": id, "result": null, "error": [20, "Unknown method", null]})
+                    }
+                };
+
+                if !response.is_null() {
+                    send_msg(&writer, response).await?;
                 }
-                json!({"id": id, "result": true, "error": null})
             }
 
-            "eth_submitHashrate" => {
-                json!({"id": id, "result": true, "error": null})
+            _ = flush_interval.tick() => {
+                do_flush_shares(&state, &db).await;
             }
+        }
+    }
 
-            other => {
-                warn!("Unknown method: {other}");
-                json!({"id": id, "result": null, "error": [20, "Unknown method", null]})
-            }
-        };
-
-        if !response.is_null() {
-            send_msg(&writer, response).await?;
+    // Flush remaining shares and close the session on disconnect.
+    do_flush_shares(&state, &db).await;
+    let session_id = state.lock().await.db_session_id;
+    if let Some(sid) = session_id {
+        if let Err(e) = db.log_session_end(sid).await {
+            error!("log_session_end failed: {e}");
         }
     }
 
     Ok(())
+}
+
+async fn do_flush_shares(state: &Arc<Mutex<MinerState>>, db: &Arc<Db>) {
+    let (agg, address, worker) = {
+        let mut st = state.lock().await;
+        if st.address.is_none() || (st.share_agg.shares_valid == 0 && st.share_agg.shares_invalid == 0) {
+            return;
+        }
+        let agg = st.share_agg.clone();
+        st.share_agg = ShareAggregate::new();
+        (agg, st.address.clone().unwrap(), st.worker.clone())
+    };
+
+    let window_end = SystemTime::now();
+    if let Err(e) = db.flush_share_window(
+        &address,
+        &worker,
+        agg.window_start,
+        window_end,
+        agg.shares_valid,
+        agg.shares_invalid,
+        agg.shares_stale,
+        agg.difficulty_avg(),
+        agg.hashrate_mhs(window_end),
+    ).await {
+        error!("flush_share_window failed: {e}");
+    }
 }
 
 async fn handle_login(
@@ -214,8 +278,10 @@ async fn handle_login(
     params: &Value,
     state: &Arc<Mutex<MinerState>>,
     current_job: &SharedJob,
-    initial_diff: u64,
+    _initial_diff: u64,
     fee_address: &Option<String>,
+    db: &Arc<Db>,
+    peer_ip: &str,
 ) -> Value {
     let login = params["login"].as_str().unwrap_or("");
     let (raw_address, worker_suffix) = login.split_once('.').unwrap_or((login, ""));
@@ -248,6 +314,21 @@ async fn handle_login(
     };
 
     info!("Miner login: {address}.{worker}");
+
+    // Log session start (fire-and-forget, don't block the response).
+    {
+        let db2 = Arc::clone(db);
+        let addr2 = address.clone();
+        let work2 = worker.clone();
+        let ip2 = peer_ip.to_string();
+        let state2 = Arc::clone(state);
+        tokio::spawn(async move {
+            match db2.log_session_start(&addr2, &work2, &ip2).await {
+                Ok(id) => state2.lock().await.db_session_id = id,
+                Err(e) => error!("log_session_start failed: {e}"),
+            }
+        });
+    }
 
     let pool_target = diff_to_target(diff);
     let target_hex = hex::encode(pool_target);
@@ -304,8 +385,10 @@ async fn handle_authorize(
     state: &Arc<Mutex<MinerState>>,
     current_job: &SharedJob,
     writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-    initial_diff: u64,
+    _initial_diff: u64,
     fee_address: &Option<String>,
+    db: &Arc<Db>,
+    peer_ip: &str,
 ) -> Value {
     let login = params[0].as_str().unwrap_or("");
     // Miners often send "address.workername" or "address.workername.password" as one string.
@@ -338,9 +421,24 @@ async fn handle_authorize(
     let diff = {
         let mut st = state.lock().await;
         st.address = Some(address.clone());
-        st.worker = worker;
+        st.worker = worker.clone();
         st.difficulty // may already be set by a prior mining.suggest_difficulty
     };
+
+    // Log session start (fire-and-forget).
+    {
+        let db2 = Arc::clone(db);
+        let addr2 = address.clone();
+        let work2 = worker.clone();
+        let ip2 = peer_ip.to_string();
+        let state2 = Arc::clone(state);
+        tokio::spawn(async move {
+            match db2.log_session_start(&addr2, &work2, &ip2).await {
+                Ok(id) => state2.lock().await.db_session_id = id,
+                Err(e) => error!("log_session_start failed: {e}"),
+            }
+        });
+    }
 
     // Send authorize ack first — some miners ignore notifications received before it.
     let _ = send_msg(writer, json!({"id": id, "result": true, "error": null})).await;
@@ -418,37 +516,46 @@ async fn handle_submit(
         Some(h) => h,
         None => {
             warn!("Invalid share for job {job_id}");
+            state.lock().await.share_agg.shares_invalid += 1;
             return json!({"id": id, "result": null, "error": [23, "low difficulty share", null]});
         }
     };
 
     info!("Valid share: job={job_id} diff={diff}");
 
+    // Record share in aggregate (valid).
+    {
+        let mut st = state.lock().await;
+        st.share_agg.shares_valid += 1;
+        st.share_agg.difficulty_sum += diff as f64;
+    }
+
     // Check if it also meets network difficulty.
     let net_final = verify::check_share(&hh_hex, &mix_hash_hex, nonce, &job.network_boundary);
     if net_final.is_some() {
         info!("*** BLOCK FOUND by {address} at height {} ***", job.height);
 
-        // Re-derive header prefix from merkle root.
         let header_prefix = job.build_header_prefix(merkle_root);
+        let worker = state.lock().await.worker.clone();
+        let (miner_payout_sats, dev_fee_sats) = job.coinbase_split();
 
-        // mix_hash raw = reverse of GetHex.
         if let Some(mix_raw) = verify::mix_hash_to_raw(&mix_hash_hex) {
-            let block_hex = hex::encode(job.serialize_block(
-                &header_prefix,
-                nonce,
-                &mix_raw,
-                &address,
-            ));
-
+            let block_hex = hex::encode(job.serialize_block(&header_prefix, nonce, &mix_raw, &address));
             let final_hash_hex = hex::encode(final_hash);
 
             match node.submit_block(&block_hex).await {
                 Ok(()) => {
                     info!("Block submitted! hash={final_hash_hex}");
-                    if let Err(e) = db::log_block(db, job.height, &final_hash_hex, &address).await {
-                        error!("DB log error: {e}");
-                    }
+                    let db2 = Arc::clone(db);
+                    let addr2 = address.clone();
+                    let hash2 = final_hash_hex.clone();
+                    let height = job.height;
+                    let community_sats = job.community_value;
+                    tokio::spawn(async move {
+                        if let Err(e) = db2.log_block(height, &hash2, &addr2, &worker, miner_payout_sats, dev_fee_sats, community_sats).await {
+                            error!("DB log_block error: {e}");
+                        }
+                    });
                 }
                 Err(e) => error!("submitblock failed: {e}"),
             }

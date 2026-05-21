@@ -79,6 +79,16 @@ impl Job {
         }
     }
 
+    /// Returns (miner_sats, fee_sats) — the coinbase split amounts.
+    pub fn coinbase_split(&self) -> (u64, u64) {
+        let fee_sats = if self.fee_percent > 0.0 && self.fee_address.is_some() {
+            (self.coinbase_value as f64 * self.fee_percent / 100.0) as u64
+        } else {
+            0
+        };
+        (self.coinbase_value - fee_sats, fee_sats)
+    }
+
     /// Build the coinbase transaction for a given miner address.
     /// Returns (coinbase_bytes, coinbase_txid_bytes, coinbase_wtxid = [0u8;32]).
     pub fn build_coinbase(&self, miner_address: &str) -> Vec<u8> {

@@ -13,4 +13,7 @@ fee_address = "M94MsdkF4WPaGCvEUMyqhTB32ogBazrzPG"
 fee_percent = 1
 
 [pool]
-db_path = "blocks.db"
+# Supabase project URL (e.g. https://xxxx.supabase.co)
+supabase_url = "https://your-project.supabase.co"
+# Service role key from Supabase dashboard → Settings → API
+supabase_service_key = "eyJ..."
