@@ -10,6 +10,7 @@ Grab the latest Linux x86_64 binary from the [Releases](../../releases) page (ro
 
 - A synced Meowcoin node with RPC and ZMQ enabled
 - Linux x86_64 (the released binary is statically linked against libzmq)
+- A [Supabase](https://supabase.com) project for stats and block logging
 
 ### Node config (`meowcoin.conf`)
 
@@ -38,20 +39,41 @@ zmq_url  = "tcp://127.0.0.1:28332"
 
 [stratum]
 port               = 3333
-initial_difficulty = 1000
+initial_difficulty = 1
+# Dev fee address — also used as the fallback for miners that send an invalid address.
+fee_address = "YourMEWCAddress"
+fee_percent = 1
 
 [pool]
-db_path = "blocks.db"   # SQLite block log
+# Supabase project URL (e.g. https://xxxx.supabase.co)
+supabase_url = "https://your-project.supabase.co"
+# Service role key from Supabase dashboard → Settings → API
+supabase_service_key = "eyJ..."
 ```
 
 ### Environment variable overrides
 
-Any config value can be overridden with an env var using the prefix `MEWC__` and `__` as the nesting separator:
+Any config value can be overridden with an env var using the prefix `MEWC_` and `__` as the nesting separator:
 
 ```bash
 MEWC_NODE__RPC_PASS=secret ./mewc-solo-pool
 MEWC_STRATUM__PORT=4444 ./mewc-solo-pool
 ```
+
+## Supabase setup
+
+Run the SQL in `supabase/schema.sql` against your Supabase project once to create the tables, indexes, views, and RLS policies. The schema includes:
+
+- `meowpow_blocks` — every block found with height, hash, finder address, payout split, and time since last block
+- `meowpow_share_windows` — 60-second share aggregates per miner (valid/invalid/stale counts, average difficulty, estimated hashrate)
+- `meowpow_miner_sessions` — connect/disconnect events per miner
+- Views for pool stats, per-miner hashrates, and pool luck
+
+All tables allow public `SELECT` (safe for a frontend to query directly with the anon key) and restrict writes to the service role key used by the pool daemon.
+
+## Dev fee
+
+A configurable percentage of each coinbase reward is split to `fee_address` at the time a block is found. The community fund vout (enforced by Meowcoin consensus) is always preserved. Set `fee_percent = 0` to disable.
 
 ## Running
 
@@ -63,14 +85,15 @@ MEWC_STRATUM__PORT=4444 ./mewc-solo-pool
 ./mewc-solo-pool --config /etc/mewc/pool.toml
 ```
 
-Point your GPU miner at `stratum+tcp://<host>:3333` and use your MEWC address as the username. The worker name is ignored.
+Point your GPU miner at `stratum+tcp://<host>:3333` and use your MEWC address as the username. Worker name is optional.
 
 ```
 # Example (TeamRedMiner)
-./teamredminer -a meowpow -o stratum+tcp://127.0.0.1:3333 -u MYourMeowcoinAddress -p x
-```
+./teamredminer -a meowpow -o stratum+tcp://127.0.0.1:3333 -u MYourMeowcoinAddress.rig1 -p x
 
-Found blocks are logged to `blocks.db` (SQLite) with height, hash, finder address, and timestamp.
+# Example (SRBMiner)
+./SRBMiner-MULTI --algorithm meowpow --pool stratum+tcp://127.0.0.1:3333 --wallet MYourMeowcoinAddress
+```
 
 ## Building from source
 
@@ -81,10 +104,4 @@ cargo build --release
 # binary at target/release/mewc-solo-pool
 ```
 
-Requires Rust stable and `pkg-config` + `libssl-dev` (for reqwest TLS).
-
-## Block log
-
-```bash
-sqlite3 blocks.db "SELECT height, hash, finder, datetime(timestamp, 'unixepoch') FROM blocks;"
-```
+Requires Rust stable, `pkg-config`, `libssl-dev`, and `libzmq3-dev`.

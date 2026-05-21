@@ -35,7 +35,7 @@ jobs:
         run: sudo apt-get install -y pkg-config libssl-dev
 
       - name: Build release binary
-        run: cargo build --release --locked
+        run: cargo build --release
 
       - name: Strip binary
         run: strip target/release/mewc-solo-pool
