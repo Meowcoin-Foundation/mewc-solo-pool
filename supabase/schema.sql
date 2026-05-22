@@ -85,7 +85,7 @@ SELECT
     (
         SELECT COALESCE(MAX(sw.peak_share_difficulty), 0)
         FROM meowpow_share_windows sw
-        WHERE sw.window_end >= COALESCE(
+        WHERE sw.window_start >= COALESCE(
             (SELECT MAX(found_at) FROM meowpow_blocks),
             now() - INTERVAL '24 hours'
         )
