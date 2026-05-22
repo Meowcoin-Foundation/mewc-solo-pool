@@ -75,10 +75,20 @@ CREATE INDEX IF NOT EXISTS meowpow_miner_sessions_active       ON meowpow_miner_
 
 -- Current pool hashrate and active miner count.
 -- AVG per worker (instantaneous rate), then SUM across workers for pool total.
+-- peak_difficulty_since_last_block: highest 60s window avg difficulty since the last block found.
+-- True per-share peak isn't stored — label this honestly on the frontend.
 CREATE OR REPLACE VIEW meowpow_pool_stats AS
 SELECT
     COUNT(*)                        AS active_miners,
-    COALESCE(SUM(hashrate_mhs), 0)  AS pool_hashrate_mhs
+    COALESCE(SUM(hashrate_mhs), 0)  AS pool_hashrate_mhs,
+    (
+        SELECT COALESCE(MAX(sw.difficulty_avg), 0)
+        FROM meowpow_share_windows sw
+        WHERE sw.window_end >= COALESCE(
+            (SELECT MAX(found_at) FROM meowpow_blocks),
+            now() - INTERVAL '24 hours'
+        )
+    )                               AS peak_difficulty_since_last_block
 FROM (
     SELECT address, worker, AVG(NULLIF(hashrate_mhs, 0)) AS hashrate_mhs
     FROM meowpow_share_windows
