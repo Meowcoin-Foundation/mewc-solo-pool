@@ -167,6 +167,7 @@ impl Db {
         shares_stale: u32,
         difficulty_avg: f64,
         hashrate_mhs: f64,
+        peak_share_difficulty: f64,
     ) -> Result<()> {
         let to_rfc = |t: SystemTime| {
             let dt = chrono::DateTime::<Utc>::from(t);
@@ -176,15 +177,16 @@ impl Db {
         self.post(
             "meowpow_share_windows",
             json!({
-                "address":        address,
-                "worker":         worker,
-                "window_start":   to_rfc(window_start),
-                "window_end":     to_rfc(window_end),
-                "shares_valid":   shares_valid,
-                "shares_invalid": shares_invalid,
-                "shares_stale":   shares_stale,
-                "difficulty_avg": difficulty_avg,
-                "hashrate_mhs":   hashrate_mhs,
+                "address":               address,
+                "worker":                worker,
+                "window_start":          to_rfc(window_start),
+                "window_end":            to_rfc(window_end),
+                "shares_valid":          shares_valid,
+                "shares_invalid":        shares_invalid,
+                "shares_stale":          shares_stale,
+                "difficulty_avg":        difficulty_avg,
+                "hashrate_mhs":          hashrate_mhs,
+                "peak_share_difficulty": peak_share_difficulty,
             }),
             "return=minimal",
         )

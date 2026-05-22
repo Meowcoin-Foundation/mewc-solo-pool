@@ -54,6 +54,7 @@ struct ShareAggregate {
     shares_invalid: u32,
     shares_stale: u32,
     difficulty_sum: f64,
+    peak_share_diff: f64,
 }
 
 impl ShareAggregate {
@@ -64,6 +65,7 @@ impl ShareAggregate {
             shares_invalid: 0,
             shares_stale: 0,
             difficulty_sum: 0.0,
+            peak_share_diff: 0.0,
         }
     }
 
@@ -286,6 +288,7 @@ async fn do_flush_shares(state: &Arc<Mutex<MinerState>>, db: &Arc<Db>) {
         agg.shares_stale,
         agg.difficulty_avg(),
         agg.hashrate_mhs(window_end),
+        agg.peak_share_diff,
     ).await {
         error!("flush_share_window failed: {e}");
     }
@@ -542,13 +545,22 @@ async fn handle_submit(
         }
     };
 
-    debug!("Valid share from {}.{} job={job_id} diff={diff}", address, worker);
+    // Actual difficulty of this specific hash: diff1_hi / hash_hi (top 128 bits).
+    let hash_hi = u128::from_be_bytes(final_hash[..16].try_into().unwrap());
+    let actual_diff = if hash_hi > 0 {
+        (0x0000_0000_FFFF_0000_0000_0000_0000_0000u128 / hash_hi) as f64
+    } else {
+        f64::MAX
+    };
+
+    debug!("Valid share from {}.{} job={job_id} diff={diff} actual_diff={actual_diff:.0}", address, worker);
 
     // Record share in aggregate (valid).
     {
         let mut st = state.lock().await;
         st.share_agg.shares_valid += 1;
         st.share_agg.difficulty_sum += diff as f64;
+        st.share_agg.peak_share_diff = st.share_agg.peak_share_diff.max(actual_diff);
         st.total_valid += 1;
     }
 
