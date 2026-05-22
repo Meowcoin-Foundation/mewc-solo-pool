@@ -94,9 +94,12 @@ struct MinerState {
     /// job_id → (Job, header_hash_hex, merkle_root)
     active_jobs: HashMap<String, (Job, String, [u8; 32])>,
     retarget_start: Instant,
+    connected_at: Instant,
     shares_since_retarget: u32,
     share_agg: ShareAggregate,
     db_session_id: Option<i64>,
+    total_valid: u32,
+    total_invalid: u32,
 }
 
 impl MinerState {
@@ -108,9 +111,12 @@ impl MinerState {
             extranonce1,
             active_jobs: HashMap::new(),
             retarget_start: Instant::now(),
+            connected_at: Instant::now(),
             shares_since_retarget: 0,
             share_agg: ShareAggregate::new(),
             db_session_id: None,
+            total_valid: 0,
+            total_invalid: 0,
         }
     }
 }
@@ -236,10 +242,22 @@ async fn handle_miner(
 
     // Flush remaining shares and close the session on disconnect.
     do_flush_shares(&state, &db).await;
-    let session_id = state.lock().await.db_session_id;
-    if let Some(sid) = session_id {
-        if let Err(e) = db.log_session_end(sid).await {
-            error!("log_session_end failed: {e}");
+    {
+        let st = state.lock().await;
+        let secs = st.connected_at.elapsed().as_secs();
+        let label = match &st.address {
+            Some(a) => format!("{}.{}", a, st.worker),
+            None => "(unauthorized)".to_string(),
+        };
+        info!(
+            "Miner disconnected: {} — {}s session, {} valid {} invalid shares",
+            label, secs, st.total_valid, st.total_invalid
+        );
+        if let Some(sid) = st.db_session_id {
+            drop(st);
+            if let Err(e) = db.log_session_end(sid).await {
+                error!("log_session_end failed: {e}");
+            }
         }
     }
 
@@ -495,6 +513,7 @@ async fn handle_submit(
         Some(a) => a.clone(),
         None => return json!({"id": id, "result": null, "error": [24, "not authorized", null]}),
     };
+    let worker = st.worker.clone();
 
     let entry = match st.active_jobs.get(&job_id) {
         Some(e) => e.clone(),
@@ -515,19 +534,22 @@ async fn handle_submit(
     let final_hash = match verify::check_share(&hh_hex, &mix_hash_hex, nonce, &pool_boundary) {
         Some(h) => h,
         None => {
-            warn!("Invalid share for job {job_id}");
-            state.lock().await.share_agg.shares_invalid += 1;
+            warn!("Invalid share from {}.{} job={job_id}", address, worker);
+            let mut st = state.lock().await;
+            st.share_agg.shares_invalid += 1;
+            st.total_invalid += 1;
             return json!({"id": id, "result": null, "error": [23, "low difficulty share", null]});
         }
     };
 
-    info!("Valid share: job={job_id} diff={diff}");
+    debug!("Valid share from {}.{} job={job_id} diff={diff}", address, worker);
 
     // Record share in aggregate (valid).
     {
         let mut st = state.lock().await;
         st.share_agg.shares_valid += 1;
         st.share_agg.difficulty_sum += diff as f64;
+        st.total_valid += 1;
     }
 
     // Check if it also meets network difficulty.

@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
         cfg.pool.supabase_service_key.clone(),
         server_id.clone(),
     );
-    pool.close_stale_sessions().await;
+    let _ = pool.close_stale_sessions().await;
     let node = Arc::new(node::NodeClient::new(&cfg.node));
     let current_job: SharedJob = Arc::new(RwLock::new(None));
 
@@ -134,8 +134,8 @@ async fn main() -> Result<()> {
                     Ok(tmpl) => {
                         let j = job::Job::from_template(tmpl, fee_address2.clone(), fee_percent);
                         *current_job2.write().await = Some(j.clone());
-                        let _ = job_tx2.send(j);
-                        info!("ZMQ: job refreshed");
+                        let _ = job_tx2.send(j.clone());
+                        info!("ZMQ: job refreshed height={}", j.height);
                     }
                     Err(e) => tracing::error!("GBT after hashblock failed: {e}"),
                 }

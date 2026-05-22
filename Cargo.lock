@@ -980,7 +980,7 @@ checksum = "882ad68ed21d118d6dff1b421b5b38302fb64667d4a71cf7ddec41b5cc82d909"
 
 [[package]]
 name = "mewc-solo-pool"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bs58",
